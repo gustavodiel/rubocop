@@ -27,43 +27,84 @@ module RuboCop
         class DeprecatedClassMethod
           include RuboCop::AST::Sexp
 
-          attr_reader :class_constant, :deprecated_method, :replacement_method
+          attr_reader :class_constant, :deprecated_method, :replacement_method, :argument_name
 
-          def initialize(deprecated:, replacement:, class_constant: nil)
+          def initialize(deprecated:, replacement:, class_constant: nil, argument_name: nil)
             @deprecated_method = deprecated
             @replacement_method = replacement
             @class_constant = class_constant
+            @argument_name = argument_name
           end
 
           def class_nodes
             @class_nodes ||=
-              if class_constant
-                [
-                  s(:const, nil, class_constant),
-                  s(:const, s(:cbase), class_constant)
-                ]
-              else
-                [nil]
+              [
+                s(:const, nil, class_constant),
+                s(:const, s(:cbase), class_constant)
+              ]
+          end
+
+          def argument_node
+            @argument_node ||= s(:sym, argument_name.to_sym)
+          end
+
+          def fail?(node)
+            first_argument = node.first_argument
+
+            if match_rules?(node)
+              if match_arguments?
+                return valid_node_arguments?(first_argument)
               end
+
+              return true
+            end
+
+            false
+          end
+
+          def deprecated_method_formatted
+            return "#{class_constant}.#{deprecated_method}(#{argument_name}:)" if argument_name
+
+            return "#{class_constant}.#{deprecated_method}" if class_constant
+
+            return deprecated_method
+          end
+
+          private
+
+          def valid_node_arguments?(argument)
+            argument.is_a?(AST::HashNode) &&
+              argument.keys.size == 1 &&
+              argument.keys.include?(argument_node)
+          end
+
+          def match_rules?(node)
+            class_nodes.include?(node.receiver) && node.method?(deprecated_method)
+          end
+
+          def match_arguments?
+            argument_name != nil
           end
         end
 
         MSG = '`%<current>s` is deprecated in favor of `%<prefer>s`.'
         DEPRECATED_METHODS_OBJECT = [
           DeprecatedClassMethod.new(deprecated: :exists?,
-                                    replacement: :exist?,
+                                    replacement: 'File.exist?',
                                     class_constant: :File),
           DeprecatedClassMethod.new(deprecated: :exists?,
-                                    replacement: :exist?,
+                                    replacement: 'Dir.exist?',
                                     class_constant: :Dir),
           DeprecatedClassMethod.new(deprecated: :iterator?,
                                     replacement: :block_given?)
         ].freeze
 
         def on_send(node)
-          check(node) do |data|
-            message = format(MSG, current: deprecated_method(data),
-                                  prefer: replacement_method(data))
+          setup_rules(cop_config['Rules'] || [])
+
+          check(node) do |match|
+            message = format(MSG, current: match.deprecated_method_formatted,
+                                  prefer: match.replacement_method)
 
             add_offense(node, location: :selector, message: message)
           end
@@ -72,7 +113,8 @@ module RuboCop
         def autocorrect(node)
           lambda do |corrector|
             check(node) do |data|
-              corrector.replace(node.loc.selector,
+              binding.pry
+              corrector.replace(node.loc.expression,
                                 data.replacement_method.to_s)
             end
           end
@@ -80,29 +122,24 @@ module RuboCop
 
         private
 
-        def check(node)
-          DEPRECATED_METHODS_OBJECT.each do |data|
-            next unless data.class_nodes.include?(node.receiver)
-            next unless node.method?(data.deprecated_method)
+        attr_accessor :rules
 
-            yield data
+        def setup_rules(new_rules)
+          @rules = DEPRECATED_METHODS_OBJECT
+
+          new_rules.each do |rule|
+            rules << DeprecatedClassMethod.new(
+              class_constant: rule['Constant'],
+              deprecated: rule['Method'],
+              replacement: rule['Replacement'],
+              argument_name: rule['ArgumentName']
+            )
           end
         end
 
-        def deprecated_method(data)
-          method_call(data.class_constant, data.deprecated_method)
-        end
-
-        def replacement_method(data)
-          method_call(data.class_constant, data.replacement_method)
-        end
-
-        def method_call(class_constant, method)
-          if class_constant
-            format('%<constant>s.%<method>s', constant: class_constant,
-                                              method: method)
-          else
-            format('%<method>s', method: method)
+        def check(node)
+          rules.each do |rule|
+            yield rule if rule.fail?(node)
           end
         end
       end
